@@ -31,8 +31,14 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ref", default="HEAD", help="Commit, branch, or tag to pin (default: HEAD).")
     parser.add_argument("--config", type=Path, help="TOML config file (keep it outside the target repository).")
     parser.add_argument("--out", type=Path, default=Path("resolv-runs"), help="Directory for run artifacts.")
-    parser.add_argument("--python", help="Interpreter used to create the venv (or run tests without one).")
-    parser.add_argument("--venv", action=argparse.BooleanOptionalAction, default=None, help="Create an isolated venv (default: on).")
+    parser.add_argument(
+        "--sandbox", choices=("docker", "local"),
+        help="Where repository code runs: isolated Docker containers (default) or this machine (trusted repos only).",
+    )
+    parser.add_argument("--python-version", help="Python version for the Docker sandbox image (default: 3.12).")
+    parser.add_argument("--image", help="Docker sandbox image template (default: python:{python_version}).")
+    parser.add_argument("--python", help="Local sandbox: interpreter used to create the venv (or run tests without one).")
+    parser.add_argument("--venv", action=argparse.BooleanOptionalAction, default=None, help="Local sandbox: create a venv (default: on).")
     parser.add_argument("--install", action="append", metavar="CMD", help="Install command run in the workspace; repeatable.")
     parser.add_argument("--test-command", help="pytest invocation, e.g. 'python -m pytest -q'.")
     parser.add_argument("--keep-workspace", action="store_true", help="Keep the temporary checkout and venv for inspection.")
@@ -67,7 +73,16 @@ def _apply_overrides(config: RunConfig, args: argparse.Namespace) -> RunConfig:
         env_changes["install_commands"] = tuple(args.install)
     if args.test_command:
         env_changes["test_command"] = args.test_command
+    if args.python_version:
+        env_changes["python_version"] = args.python_version
     config = dataclasses.replace(config, environment=dataclasses.replace(env, **env_changes))
+    sandbox_changes = {}
+    if args.sandbox:
+        sandbox_changes["backend"] = args.sandbox
+    if args.image:
+        sandbox_changes["image"] = args.image
+    if sandbox_changes:
+        config = dataclasses.replace(config, sandbox=dataclasses.replace(config.sandbox, **sandbox_changes))
     if getattr(args, "model", None):
         config = dataclasses.replace(config, model=dataclasses.replace(config.model, name=args.model))
     if getattr(args, "max_cost_usd", None) is not None:
