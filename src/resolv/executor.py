@@ -1,21 +1,24 @@
-"""Command execution with a scrubbed environment, timeouts, and output caps.
+"""Command execution with timeouts, cancellation, and output caps.
 
-Phase 1 runs commands on the local machine. Commands get a minimal
-environment (no API keys or tokens from the host), a private HOME, their own
-process group so timeouts and cancellation kill the whole tree, and capped
-output. Network isolation and VM-level sandboxing are Phase 3 work.
+The runner only drives processes on the orchestrator host. Where those
+processes run repository code is decided by the sandbox (see resolv.sandbox):
+directly on the host for the local backend, or via ``docker`` for the
+isolated backend. Output is capped while it streams, so a noisy or malicious
+command cannot exhaust host memory or disk.
 """
 
 from __future__ import annotations
 
+import collections
 import itertools
 import os
 import re
 import shutil
 import signal
 import subprocess
-import tempfile
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -26,6 +29,7 @@ from resolv.redact import Redactor
 
 _SAFE_HOST_VARS = ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM")
 _POLL_SECONDS = 0.25
+_CHUNK = 65536
 
 
 @dataclass
@@ -59,6 +63,7 @@ class CommandResult:
 
 
 def build_env(*, home: Path, path_prefix: list[Path], venv: Path | None, pass_env: tuple[str, ...] = ()) -> dict[str, str]:
+    """Minimal environment for commands run directly on the host (local backend)."""
     env = {k: os.environ[k] for k in (*_SAFE_HOST_VARS, *pass_env) if k in os.environ}
     env["PATH"] = os.pathsep.join([*(str(p) for p in path_prefix), os.environ.get("PATH", os.defpath)])
     env["HOME"] = str(home)
@@ -67,6 +72,41 @@ def build_env(*, home: Path, path_prefix: list[Path], venv: Path | None, pass_en
     if venv is not None:
         env["VIRTUAL_ENV"] = str(venv)
     return env
+
+
+class CappedOutput:
+    """Keeps the first and last ``limit / 2`` bytes of a stream."""
+
+    def __init__(self, limit: int) -> None:
+        self.half = max(1, limit // 2)
+        self.head = bytearray()
+        self.tail: collections.deque[bytes] = collections.deque()
+        self.tail_size = 0
+        self.total = 0
+
+    def feed(self, data: bytes) -> None:
+        self.total += len(data)
+        room = self.half - len(self.head)
+        if room > 0:
+            self.head += data[:room]
+            data = data[room:]
+        if not data:
+            return
+        self.tail.append(data)
+        self.tail_size += len(data)
+        while self.tail and self.tail_size - len(self.tail[0]) >= self.half:
+            self.tail_size -= len(self.tail.popleft())
+
+    def text(self) -> tuple[str, bool]:
+        tail = b"".join(self.tail)
+        if len(tail) > self.half:
+            tail = tail[-self.half :]
+        omitted = self.total - len(self.head) - len(tail)
+        head = self.head.decode("utf-8", errors="replace")
+        if omitted <= 0:
+            return head + tail.decode("utf-8", errors="replace"), False
+        marker = f"\n\n... [{omitted} bytes of output truncated] ...\n\n"
+        return head + marker + tail.decode("utf-8", errors="replace"), True
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -78,19 +118,6 @@ def _kill_group(proc: subprocess.Popen) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:  # pragma: no cover
         proc.kill()
-
-
-def _read_capped(fh, max_chars: int) -> tuple[str, bool]:
-    fh.seek(0, os.SEEK_END)
-    size = fh.tell()
-    fh.seek(0)
-    if size <= max_chars:
-        return fh.read().decode("utf-8", errors="replace"), False
-    half = max_chars // 2
-    head = fh.read(half).decode("utf-8", errors="replace")
-    fh.seek(size - half)
-    tail = fh.read().decode("utf-8", errors="replace")
-    return f"{head}\n\n... [{size - 2 * half} bytes of output truncated] ...\n\n{tail}", True
 
 
 class CommandRunner:
@@ -115,45 +142,84 @@ class CommandRunner:
         self.history: list[CommandResult] = []
         self._counter = itertools.count(1)
 
-    def run(self, argv: list[str], *, label: str, extra_env: dict[str, str] | None = None) -> CommandResult:
-        timeout = self.budget.command_timeout()
-        env = {**self.env, **(extra_env or {})}
-        executable = shutil.which(argv[0], path=env.get("PATH"))
+    def run(
+        self,
+        argv: list[str],
+        *,
+        label: str,
+        extra_env: dict[str, str] | None = None,
+        exec_argv: list[str] | None = None,
+        exec_env: dict[str, str] | None = None,
+        kill: Callable[[], None] | None = None,
+        timeout: float | None = None,
+    ) -> CommandResult:
+        """Run a command; ``argv`` is what gets recorded, ``exec_argv`` what actually executes.
+
+        ``kill`` is called on timeout or cancellation, e.g. to stop a container
+        that outlives the client process.
+        """
+        limit = self.budget.command_timeout()
+        if timeout is not None:
+            limit = min(limit, timeout)
+        if exec_argv is None:
+            env = {**self.env, **(extra_env or {})}
+            exec_argv = list(argv)
+        else:
+            env = dict(exec_env if exec_env is not None else self.env)
         start = time.monotonic()
+        executable = shutil.which(exec_argv[0], path=env.get("PATH"))
         if executable is None:
-            result = CommandResult(label, list(argv), None, 0.0, "", error=f"command not found: {argv[0]}")
-            return self._finish(result)
+            return self._finish(CommandResult(label, list(argv), None, 0.0, "", error=f"command not found: {exec_argv[0]}"))
 
+        capped = CappedOutput(self.max_output_chars)
+        proc = subprocess.Popen(
+            [executable, *exec_argv[1:]],
+            cwd=self.cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        def pump() -> None:
+            for chunk in iter(lambda: proc.stdout.read1(_CHUNK), b""):
+                capped.feed(chunk)
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
         timed_out = False
-        with tempfile.TemporaryFile() as out:
-            proc = subprocess.Popen(
-                [executable, *argv[1:]],
-                cwd=self.cwd,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=out,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            deadline = start + timeout
-            try:
-                while True:
-                    try:
-                        proc.wait(timeout=_POLL_SECONDS)
-                        break
-                    except subprocess.TimeoutExpired:
-                        if self.budget.cancel_event.is_set():
-                            raise RunCancelled() from None
-                        if time.monotonic() >= deadline:
-                            timed_out = True
-                            _kill_group(proc)
-                            break
-            except BaseException:
-                _kill_group(proc)
-                self.events.emit("command_aborted", label=label, argv=argv)
-                raise
-            output, truncated = _read_capped(out, self.max_output_chars)
+        deadline = start + limit
 
+        def stop() -> None:
+            if kill is not None:
+                try:
+                    kill()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+            _kill_group(proc)
+
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=_POLL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self.budget.cancel_event.is_set():
+                        raise RunCancelled() from None
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        stop()
+                        break
+        except BaseException:
+            stop()
+            self.events.emit("command_aborted", label=label, argv=argv)
+            raise
+        finally:
+            reader.join(timeout=10)
+            proc.stdout.close()
+
+        output, truncated = capped.text()
         result = CommandResult(
             label=label,
             argv=list(argv),
@@ -164,6 +230,10 @@ class CommandRunner:
             output_truncated=truncated,
         )
         return self._finish(result)
+
+    def record_error(self, argv: list[str], *, label: str, error: str, output: str = "") -> CommandResult:
+        """Record a command that could not be started or completed by the sandbox."""
+        return self._finish(CommandResult(label, list(argv), None, 0.0, self.redact(output), error=error))
 
     def _finish(self, result: CommandResult) -> CommandResult:
         n = next(self._counter)
