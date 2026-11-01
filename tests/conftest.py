@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -8,13 +7,14 @@ from pathlib import Path
 import pytest
 
 from resolv.budget import Budget
-from resolv.config import EnvironmentConfig, Limits, ModelConfig, RunConfig
+from resolv.config import EnvironmentConfig, Limits, RunConfig, SandboxConfig
 from resolv.events import EventLog
-from resolv.executor import CommandRunner, build_env
 from resolv.model.scripted import ScriptedModel, call, respond
 from resolv.orchestrator import Issue, Orchestrator, RunRequest
 from resolv.redact import Redactor
+from resolv.sandbox import create_sandbox
 from resolv.testrun import PytestRunner
+from resolv.workspace import Workspace
 
 BUGGY_LINE = "    return year % 4 == 0\n"
 FIXED_LINE = "    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)\n"
@@ -55,9 +55,13 @@ def make_repo(root: Path, files: dict[str, str]) -> Path:
     return root
 
 
-def make_config(*, environment: dict | None = None, **limits) -> RunConfig:
+def make_config(*, environment: dict | None = None, sandbox: dict | None = None, **limits) -> RunConfig:
     env = {"python": sys.executable, "venv": False, **(environment or {})}
-    return RunConfig(environment=EnvironmentConfig(**env), limits=Limits(**limits)).validate()
+    return RunConfig(
+        environment=EnvironmentConfig(**env),
+        limits=Limits(**limits),
+        sandbox=SandboxConfig(**{"backend": "local", **(sandbox or {})}),
+    ).validate()
 
 
 def run_resolv(repo: Path, steps, out: Path, *, config: RunConfig | None = None, issue: str = ISSUE_TEXT,
@@ -122,29 +126,24 @@ def toy_repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def make_pytest_runner(tmp_path: Path):
-    """Factory: PytestRunner over a repo using the current interpreter."""
+    """Factory: PytestRunner over a repo, using a local sandbox and the current interpreter."""
 
     def factory(repo: Path) -> PytestRunner:
-        shims = tmp_path / "shims"
-        shims.mkdir(exist_ok=True)
-        shim = shims / "python"
-        shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
-        shim.chmod(0o755)
-        home = tmp_path / "home"
-        home.mkdir(exist_ok=True)
+        sandbox_dir = tmp_path / "sandbox"
         logs = tmp_path / "logs"
-        logs.mkdir(exist_ok=True)
-        results = tmp_path / "results"
-        results.mkdir(exist_ok=True)
-        runner = CommandRunner(
-            cwd=repo,
-            env=build_env(home=home, path_prefix=[shims], venv=None),
-            budget=Budget(Limits(), ModelConfig()),
+        for d in (sandbox_dir, logs):
+            d.mkdir(exist_ok=True)
+        config = make_config()
+        sandbox = create_sandbox(
+            config,
+            workspace=Workspace(repo, "HEAD"),
+            temp_dir=sandbox_dir,
+            run_id="test",
+            budget=Budget(config.limits, config.model),
             events=EventLog(tmp_path / "events.jsonl", Redactor()),
             logs_dir=logs,
             redactor=Redactor(),
-            max_output_chars=50_000,
         )
-        return PytestRunner(runner, "python -m pytest", results, repo)
+        return PytestRunner(sandbox, "python -m pytest")
 
     return factory
