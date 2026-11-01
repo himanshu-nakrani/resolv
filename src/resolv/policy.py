@@ -45,6 +45,40 @@ SKIP_MARKER_PATTERNS = tuple(
 )
 
 
+# Agent-written tests run inside the same process as pytest and resolv's result
+# collector, so they could fake their own outcome. Production code could detect
+# that it is under test. These checks catch the obvious forms; reviewers and
+# held-out tests remain the real backstop.
+_RESULTS_ACCESS = (re.compile(r"RESOLV_|resolv_pytest_results"), "accesses resolv's result collection")
+TEST_INTEGRITY_PATTERNS = (
+    _RESULTS_ACCESS,
+    (re.compile(r"\bos\._exit\b"), "calls os._exit"),
+    (re.compile(r"\bpluginmanager\b"), "manipulates pytest plugins"),
+    (re.compile(r"\bexitstatus\b"), "touches pytest's exit status"),
+    (re.compile(r"^\s*(?:async\s+)?def\s+pytest_\w+\s*\("), "defines pytest hooks"),
+    (re.compile(r"(?<![\w.])(?:exec|eval|compile|__import__)\s*\("), "uses dynamic code execution"),
+    (re.compile(r"\batexit\b"), "registers exit handlers"),
+)
+PRODUCTION_INTEGRITY_PATTERNS = (
+    _RESULTS_ACCESS,
+    (
+        re.compile(r"PYTEST_CURRENT_TEST|\b_pytest\b|['\"]pytest['\"]\s+(?:not\s+)?in\s+sys\.modules|sys\.modules\.get\(\s*['\"]pytest"),
+        "behaves differently when running under pytest",
+    ),
+)
+
+
+def integrity_problems(lines: list[str], *, test: bool) -> list[str]:
+    patterns = TEST_INTEGRITY_PATTERNS if test else PRODUCTION_INTEGRITY_PATTERNS
+    found = []
+    for line in lines:
+        for pattern, reason in patterns:
+            if pattern.search(line):
+                found.append(f"{reason}: {line.strip()[:120]}")
+                break
+    return found
+
+
 def protected_reason(path: str) -> str | None:
     pure = PurePosixPath(path)
     name = pure.name
@@ -151,9 +185,13 @@ def check_patch(ws: Workspace, *, stage: str, limits: Limits, reproduction_commi
             if not is_append_only(old, ws.read_text(path)):
                 add(Violation("existing_test_modified", path, f"{path}: existing test content was changed or removed; only appending new tests is allowed"))
         if path.endswith(".py"):
-            markers = skip_markers(ws.added_lines(path))
+            added = ws.added_lines(path)
+            markers = skip_markers(added)
             if markers:
                 add(Violation("skip_marker_added", path, f"{path}: adds skip/xfail markers: {markers[0][:120]}"))
+            problems = integrity_problems(added, test=test)
+            if problems:
+                add(Violation("integrity_check", path, f"{path}: {problems[0]}"))
         if stage == REPRODUCE and not test:
             add(Violation("production_change_during_reproduction", path, f"{path}: production code must not change during reproduction"))
 
