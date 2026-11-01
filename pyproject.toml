@@ -6,11 +6,18 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+service = ["flask>=3.0", "sqlalchemy>=2.0", "pyjwt[crypto]>=2.8"]
+postgres = ["psycopg[binary]>=3.1"]
+s3 = ["boto3>=1.34"]
+
 [project.scripts]
 resolv = "resolv.cli:main"
+resolv-service = "resolv.service.cli:main"
+resolv-bench = "resolv.bench.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "resolv[service]"]
 
 [build-system]
 requires = ["hatchling"]
