@@ -14,16 +14,23 @@ def utc_now() -> str:
 
 
 class EventLog:
-    def __init__(self, path: Path, redactor: Redactor) -> None:
+    def __init__(self, path: Path, redactor: Redactor, listeners: list | None = None) -> None:
         self.path = path
         self._redact = redactor
         self._fh = path.open("a", encoding="utf-8")
         self.stage = "init"
+        # Callables receiving each redacted event, e.g. to mirror progress into a database.
+        self.listeners = list(listeners or [])
 
     def emit(self, kind: str, **data) -> None:
         record = {"ts": utc_now(), "stage": self.stage, "kind": kind, **self._redact.deep(data)}
         self._fh.write(json.dumps(record, default=str) + "\n")
         self._fh.flush()
+        for listener in self.listeners:
+            try:
+                listener(record)
+            except Exception:  # noqa: BLE001 - observers must not break the run
+                pass
 
     def close(self) -> None:
         self._fh.close()
