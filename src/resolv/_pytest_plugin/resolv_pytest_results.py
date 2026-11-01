@@ -62,7 +62,8 @@ def pytest_runtest_makereport(item, call):
 def pytest_runtest_logreport(report):
     nodeid = report.nodeid
     if hasattr(report, "wasxfail"):
-        outcome = "xfailed" if report.skipped else "xpassed"
+        # A strict xfail that passes is reported as failed and fails the session.
+        outcome = "xfailed" if report.skipped else "failed" if report.failed else "xpassed"
     elif report.when == "call":
         outcome = report.outcome
     elif report.failed:

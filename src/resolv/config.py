@@ -8,6 +8,7 @@ budgets, or policy.
 
 from __future__ import annotations
 
+import re
 import shlex
 import sys
 import tomllib
@@ -20,7 +21,9 @@ from resolv.errors import ConfigError
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
-    # Interpreter used to create the run venv (or used directly when venv is off).
+    # Python version for the Docker sandbox image (fills {python_version} in sandbox.image).
+    python_version: str = "3.12"
+    # Local sandbox only: interpreter used to create the run venv (or used directly when venv is off).
     python: str = sys.executable
     venv: bool = True
     # Run in order inside the workspace after the venv is created, e.g.
@@ -30,6 +33,29 @@ class EnvironmentConfig:
     test_command: str = "python -m pytest"
     # Host environment variables passed to commands (e.g. proxy settings).
     pass_env: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SandboxConfig:
+    # "docker" (isolated, default) or "local" (host execution; trusted repositories only).
+    backend: str = "docker"
+    image: str = "python:{python_version}"
+    cpus: float = 2.0
+    memory_mb: int = 4096
+    pids_limit: int = 512
+    file_size_limit_mb: int = 1024
+    # Container writable-layer cap such as "10G"; needs a storage driver that supports --storage-opt size.
+    storage_size: str = ""
+    # Alternative OCI runtime such as "runsc" (gVisor) for stronger isolation.
+    runtime: str = ""
+    # Setup-phase network: "proxy" (allowlisted hosts only) or "none".
+    setup_network: str = "proxy"
+    allowed_hosts: tuple[str, ...] = ("pypi.org", "files.pythonhosted.org")
+    user: str = "1000:1000"
+    docker: str = "docker"
+
+
+_HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))*$")
 
 
 @dataclass(frozen=True)
@@ -67,6 +93,7 @@ class RunConfig:
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     limits: Limits = field(default_factory=Limits)
     model: ModelConfig = field(default_factory=ModelConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
     def validate(self) -> RunConfig:
         try:
@@ -87,12 +114,31 @@ class RunConfig:
         for name in ("max_output_tokens", "request_timeout_seconds"):
             if getattr(self.model, name) <= 0:
                 raise ConfigError(f"model.{name} must be positive")
+        if not re.fullmatch(r"\d+\.\d+", self.environment.python_version):
+            raise ConfigError("environment.python_version must look like '3.12'")
+        self._validate_sandbox()
         if self.model.data_collection not in ("allow", "deny"):
             raise ConfigError("model.data_collection must be 'allow' or 'deny'")
         for name in ("input_cost_per_mtok", "output_cost_per_mtok"):
             if getattr(self.model, name) < 0:
                 raise ConfigError(f"model.{name} must not be negative")
         return self
+
+    def _validate_sandbox(self) -> None:
+        s = self.sandbox
+        if s.backend not in ("docker", "local"):
+            raise ConfigError("sandbox.backend must be 'docker' or 'local'")
+        if s.setup_network not in ("proxy", "none"):
+            raise ConfigError("sandbox.setup_network must be 'proxy' or 'none'")
+        if s.cpus <= 0 or s.memory_mb < 128 or s.pids_limit < 16 or s.file_size_limit_mb < 1:
+            raise ConfigError("sandbox limits are too small (cpus > 0, memory_mb >= 128, pids_limit >= 16, file_size_limit_mb >= 1)")
+        if not re.fullmatch(r"\d+(:\d+)?", s.user):
+            raise ConfigError("sandbox.user must be a numeric uid or uid:gid")
+        if not s.image or any(ch.isspace() for ch in s.image):
+            raise ConfigError("sandbox.image must be an image reference without spaces")
+        for host in s.allowed_hosts:
+            if not _HOST_RE.match(host):
+                raise ConfigError(f"sandbox.allowed_hosts entry is not a host name: {host!r}")
 
 
 def _coerce(section: str, key: str, default: Any, value: Any) -> Any:
@@ -116,7 +162,7 @@ def _coerce(section: str, key: str, default: Any, value: Any) -> Any:
             raise ConfigError(f"{where} must be a list of strings")
         return tuple(value)
     if isinstance(default, str):
-        if not isinstance(value, str) or not value.strip():
+        if not isinstance(value, str) or (default and not value.strip()):
             raise ConfigError(f"{where} must be a non-empty string")
         return value
     raise ConfigError(f"{where} has an unsupported type")  # pragma: no cover
@@ -143,11 +189,16 @@ def load_config(path: Path | None) -> RunConfig:
         raise ConfigError(f"cannot read config file {path}: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"invalid TOML in {path}: {exc}") from exc
-    unknown = sorted(set(data) - {"environment", "limits", "model"})
+    return config_from_dict(data)
+
+
+def config_from_dict(data: dict) -> RunConfig:
+    unknown = sorted(set(data) - {"environment", "limits", "model", "sandbox"})
     if unknown:
         raise ConfigError(f"unknown section(s): {', '.join(unknown)}")
     return RunConfig(
         environment=_section(EnvironmentConfig, data.get("environment", {}), "environment"),
         limits=_section(Limits, data.get("limits", {}), "limits"),
         model=_section(ModelConfig, data.get("model", {}), "model"),
+        sandbox=_section(SandboxConfig, data.get("sandbox", {}), "sandbox"),
     ).validate()

@@ -48,11 +48,23 @@ class RunRecord:
     artifacts: dict = field(default_factory=dict)
 
 
-ENVIRONMENT_LIMITATIONS = (
-    "Phase 1 runs repository code directly on this machine as the current user, with a scrubbed environment "
-    "but without network isolation or VM sandboxing. Run it only on repositories you trust or inside a "
-    "disposable VM/container."
+LOCAL_SANDBOX_WARNING = (
+    "Repository code ran directly on this machine as the current user (local sandbox), with a scrubbed "
+    "environment but without network isolation. Use the Docker sandbox for repositories you do not fully trust."
 )
+
+
+def isolation_note(r: RunRecord) -> str:
+    iso = (r.environment or {}).get("isolation") or {}
+    if iso.get("backend") != "docker":
+        return LOCAL_SANDBOX_WARNING
+    limits = iso.get("limits", {})
+    return (
+        f"Repository code ran in disposable Docker containers (image `{iso.get('image')}`, runtime {iso.get('runtime')}, "
+        f"user {iso.get('user')}): {iso.get('network')}; {iso.get('credentials')}; {iso.get('mounts')}. Limits: "
+        f"{limits.get('cpus')} CPUs, {limits.get('memory_mb')} MB memory, {limits.get('pids')} processes, "
+        f"{limits.get('max_file_size_mb')} MB max file size, storage {limits.get('storage')}."
+    )
 
 
 def _md_escape(text: str) -> str:
@@ -193,7 +205,8 @@ def render_markdown(r: RunRecord) -> str:
     if r.mode == "run":
         notes.append("The regression test was written by the agent. A passing test is evidence, not proof, that the issue is solved.")
     notes += r.warnings
-    notes.append(ENVIRONMENT_LIMITATIONS)
+    if r.environment.get("isolation"):
+        notes.append(isolation_note(r))
     out += _bullets(notes) + [""]
 
     out += ["## Run details", "", "| Stage | Status | Duration | Summary |", "|---|---|---|---|"]
