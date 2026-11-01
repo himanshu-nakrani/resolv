@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import secrets
-import shlex
 import shutil
 import tempfile
 import time
@@ -36,10 +35,10 @@ from resolv.errors import (
     WorkspaceError,
 )
 from resolv.events import EventLog, utc_now
-from resolv.executor import CommandRunner, build_env
 from resolv.model import API_KEY_ENV, ModelClient, create_client
 from resolv.redact import Redactor
 from resolv.report import RunRecord, write_reports
+from resolv.sandbox import Sandbox, SetupError, create_sandbox
 from resolv.testrun import (
     PytestRunner,
     TestRun,
@@ -113,7 +112,7 @@ class _Context:
     """Mutable per-run state shared between stages."""
 
     workspace: Workspace | None = None
-    runner: CommandRunner | None = None
+    sandbox: Sandbox | None = None
     pytest: PytestRunner | None = None
     baseline: TestRun | None = None
     diagnosis: dict | None = None
@@ -141,6 +140,7 @@ class Orchestrator:
         *,
         client: ModelClient | None = None,
         environ: Mapping[str, str] | None = None,
+        listeners: list | None = None,
     ) -> None:
         self.request = request
         self.config = request.config
@@ -150,6 +150,7 @@ class Orchestrator:
         self.run_id = request.run_id or new_run_id()
         self.run_dir = request.out_dir.resolve() / self.run_id
         self.budget = Budget(self.limits, self.config.model)
+        self.listeners = list(listeners or [])
         self.ctx = _Context()
         issue = request.issue
         self.record = RunRecord(
@@ -160,8 +161,8 @@ class Orchestrator:
             mode="check" if request.check_only else "run",
             issue={"title": issue.title, "url": issue.url, "source": issue.source} if issue else None,
             environment={
-                "python": self.config.environment.python,
-                "venv": self.config.environment.venv,
+                "sandbox": self.config.sandbox.backend,
+                "python_version": self.config.environment.python_version,
                 "install_commands": list(self.config.environment.install_commands),
                 "test_command": self.config.environment.test_command,
             },
@@ -179,7 +180,7 @@ class Orchestrator:
         (self.run_dir / "logs").mkdir()
         secrets_in_env = [self.environ.get(name) for name in API_KEY_ENV.values()]
         self.redactor = Redactor(secrets_in_env)
-        self.events = EventLog(self.run_dir / "events.jsonl", self.redactor)
+        self.events = EventLog(self.run_dir / "events.jsonl", self.redactor, listeners=self.listeners)
         self.events.emit("run_started", run_id=self.run_id, repo=str(self.request.repo), ref=self.request.ref)
         try:
             self._execute()
@@ -215,8 +216,12 @@ class Orchestrator:
         if self.record.model is not None and upstream:
             self.record.model["upstream_providers"] = sorted(upstream)
         self.record.warnings = self.ctx.warnings
-        if self.ctx.runner is not None:
-            self.record.commands = [c.summary() for c in self.ctx.runner.history]
+        if self.ctx.sandbox is not None:
+            self.record.commands = [c.summary() for c in self.ctx.sandbox.runner.history]
+            try:
+                self.ctx.sandbox.close()
+            except Exception as exc:  # noqa: BLE001 - cleanup must not hide the outcome
+                self.events.emit("sandbox_cleanup_failed", error=repr(exc))
         write_reports(self.record, self.run_dir, self.redactor)
         self.events.close()
         if self.ctx.temp_dir is not None:
@@ -296,59 +301,30 @@ class Orchestrator:
             self.ctx.warnings.append(f"The issue text was truncated to {self.limits.max_issue_chars} characters.")
 
     def _setup(self) -> None:
-        env_cfg = self.config.environment
         with self._stage("setup") as stage:
             temp = Path(tempfile.mkdtemp(prefix=f"resolv-{self.run_id}-"))
             self.ctx.temp_dir = temp
             ws = Workspace.clone(self.request.repo.resolve(), self.record.base_commit, temp / "repo")
             self.ctx.workspace = ws
-            home, bin_dir, venv = temp / "home", temp / "bin", temp / "venv"
-            home.mkdir()
-            bin_dir.mkdir()
-            prefix = [venv / "bin"] if env_cfg.venv else [bin_dir]
-            if not env_cfg.venv:
-                # Shims make `python` in configured commands mean the configured interpreter.
-                interpreter = shutil.which(env_cfg.python) or env_cfg.python
-                for name in ("python", "python3"):
-                    shim = bin_dir / name
-                    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(interpreter)} "$@"\n')
-                    shim.chmod(0o755)
-            env = build_env(home=home, path_prefix=prefix, venv=venv if env_cfg.venv else None, pass_env=env_cfg.pass_env)
-            runner = CommandRunner(
-                cwd=ws.root,
-                env=env,
+            sandbox_dir = temp / "sandbox"
+            sandbox_dir.mkdir()
+            sandbox = create_sandbox(
+                self.config,
+                workspace=ws,
+                temp_dir=sandbox_dir,
+                run_id=self.run_id,
                 budget=self.budget,
                 events=self.events,
                 logs_dir=self.run_dir / "logs",
                 redactor=self.redactor,
-                max_output_chars=self.limits.max_command_output_chars,
             )
-            self.ctx.runner = runner
-            results_dir = temp / "results"
-            results_dir.mkdir()
-            self.ctx.pytest = PytestRunner(runner, env_cfg.test_command, results_dir, ws.root)
-
-            if env_cfg.venv:
-                created = runner.run([env_cfg.python, "-m", "venv", str(venv)], label="setup-venv")
-                if not created.ok:
-                    raise StopRun(Outcome.BLOCKED, "install_failed", f"Creating the virtual environment failed ({created.describe_status()}); see {created.log_path}.")
-            for i, command in enumerate(env_cfg.install_commands, 1):
-                result = runner.run(shlex.split(command), label=f"setup-install-{i}")
-                if not result.ok:
-                    raise StopRun(
-                        Outcome.BLOCKED,
-                        "install_failed",
-                        f"Install command {command!r} failed ({result.describe_status()}); see {result.log_path}. "
-                        "This is an environment problem, not a code failure.",
-                    )
-            modified = ws.tracked_modifications()
-            if modified:
-                raise StopRun(
-                    Outcome.BLOCKED, "environment_error",
-                    f"Environment setup modified tracked files: {', '.join(modified[:5])}.",
-                )
-            ignored = ws.ignore_untracked()
-            stage["summary"] = f"Workspace ready; {len(ignored)} setup artifacts excluded from diffs"
+            self.ctx.sandbox = sandbox
+            self.record.environment["isolation"] = sandbox.describe()
+            self.ctx.pytest = PytestRunner(sandbox, self.config.environment.test_command)
+            try:
+                stage["summary"] = sandbox.setup()
+            except SetupError as exc:
+                raise StopRun(Outcome.BLOCKED, exc.code, exc.message) from None
 
     def _run_baseline(self) -> None:
         with self._stage("baseline") as stage:
