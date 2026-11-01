@@ -83,7 +83,7 @@ class Workspace:
 
     @classmethod
     def clone(cls, source: Path, commit: str, dest: Path) -> Workspace:
-        git(dest.parent, "clone", "--quiet", "--no-checkout", str(source), str(dest))
+        git(dest.parent, "clone", "--quiet", "--no-hardlinks", "--no-checkout", str(source), str(dest))
         git(dest, "checkout", "--quiet", "--detach", commit)
         return cls(dest, commit)
 

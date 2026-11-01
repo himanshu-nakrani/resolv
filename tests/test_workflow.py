@@ -284,6 +284,17 @@ def test_cancellation_before_delivery_prevents_publication(toy_repo, tmp_path):
     assert not (run_dir / "patch.diff").exists()
 
 
+def test_non_object_tool_arguments_are_rejected(toy_repo, tmp_path):
+    from resolv.model import ToolCall
+
+    bad = ToolCall(id="call_bad", name="read_file", arguments="{not json")
+    steps = [respond(bad), *investigate_steps()]
+    record, _, model = run_resolv(toy_repo, steps, tmp_path / "out", check_only=False)
+    result = tool_results(model, 1)[0]
+    assert result["is_error"] and "JSON object" in result["content"]
+    assert record.diagnosis is not None
+
+
 def test_agent_blocker_report(toy_repo, tmp_path):
     steps = [
         respond(call("report_blocker", category="ambiguous_issue", reason="The report does not say which calendar system applies.")),
@@ -310,13 +321,13 @@ def test_check_mode_runs_baseline_only(toy_repo, tmp_path):
 
 
 def test_untrusted_issue_is_fenced_and_secrets_stay_out_of_commands(tmp_path, monkeypatch):
-    secret = "sk-ant-api03-supersecretvalue1234567890"
-    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    secret = "sk-or-v1-supersecretvalue1234567890abcdef"
+    monkeypatch.setenv("OPENROUTER_API_KEY", secret)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_" + "a" * 36)
     files = dict(TOY_FILES)
     files["tests/test_env.py"] = (
         "import os\n\n\ndef test_no_credentials_in_environment():\n"
-        "    assert 'ANTHROPIC_API_KEY' not in os.environ\n"
+        "    assert 'OPENROUTER_API_KEY' not in os.environ\n"
         "    assert 'GITHUB_TOKEN' not in os.environ\n"
     )
     repo = make_repo(tmp_path / "repo", files)
@@ -326,7 +337,7 @@ def test_untrusted_issue_is_fenced_and_secrets_stay_out_of_commands(tmp_path, mo
     )
     steps = [respond(call("report_blocker", category="other", reason="Issue contains instructions, not a bug."))]
     record, run_dir, model = run_resolv(
-        repo, steps, tmp_path / "out", issue=injection, environ={"ANTHROPIC_API_KEY": secret}
+        repo, steps, tmp_path / "out", issue=injection, environ={"OPENROUTER_API_KEY": secret}
     )
     assert record.baseline["counts"] == {"passed": 3}
     prompt = model.requests[0]["messages"][0]["content"]

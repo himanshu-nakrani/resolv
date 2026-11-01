@@ -22,12 +22,13 @@ class ToolSpec:
 class ToolCall:
     id: str
     name: str
-    arguments: dict
+    # A str holds raw arguments that were not a JSON object.
+    arguments: dict | str
 
 
 @dataclass
 class ModelResponse:
-    # Provider-native content blocks, echoed back verbatim in the conversation.
+    # Neutral content blocks (text / tool_use), echoed back verbatim in the conversation.
     content: list[dict]
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
@@ -47,20 +48,22 @@ class ModelClient(Protocol):
     ) -> ModelResponse: ...
 
 
-API_KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY"}
+API_KEY_ENV = {"openrouter": "OPENROUTER_API_KEY"}
 
 
 def create_client(config: ModelConfig, environ: Mapping[str, str]) -> ModelClient:
-    if config.provider == "anthropic":
-        from resolv.model.anthropic import AnthropicClient
+    if config.provider == "openrouter":
+        from resolv.model.openrouter import DEFAULT_BASE_URL, OpenRouterClient
 
-        key = environ.get(API_KEY_ENV["anthropic"])
+        key = environ.get(API_KEY_ENV["openrouter"])
         if not key:
-            raise ConfigError("ANTHROPIC_API_KEY is not set")
-        return AnthropicClient(
+            raise ConfigError("OPENROUTER_API_KEY is not set")
+        return OpenRouterClient(
             model=config.name,
             api_key=key,
-            base_url=environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com",
+            base_url=environ.get("OPENROUTER_BASE_URL") or DEFAULT_BASE_URL,
             timeout=config.request_timeout_seconds,
+            data_collection=config.data_collection,
+            zero_data_retention=config.zero_data_retention,
         )
-    raise ConfigError(f"unsupported model provider: {config.provider!r} (Phase 1 supports 'anthropic')")
+    raise ConfigError(f"unsupported model provider: {config.provider!r} (Phase 1 supports 'openrouter')")

@@ -75,7 +75,7 @@ def render_markdown(r: RunRecord) -> str:
     title = r.issue["title"] if r.issue else "environment check"
     out.append(f"# resolv report: {title}\n")
     if r.mode == "run":
-        model = f"{r.model['provider']}/{r.model['name']}" if r.model else "an AI model"
+        model = f"{r.model['name']} via {r.model['provider']}" if r.model else "an AI model"
         out.append(
             f"> **AI-generated proposed patch.** Produced by resolv (Phase 1 local prototype) using {model}. "
             "It has not been reviewed by a human; review it before applying.\n"
@@ -94,9 +94,12 @@ def render_markdown(r: RunRecord) -> str:
                 "Model usage",
                 f"{usage.get('model_calls', 0)} calls, {usage.get('input_tokens', 0)} input + "
                 f"{usage.get('cache_read_tokens', 0)} cached + {usage.get('cache_write_tokens', 0)} cache-write input, "
-                f"{usage.get('output_tokens', 0)} output tokens; estimated ${usage.get('estimated_cost_usd', 0):.2f}",
+                f"{usage.get('output_tokens', 0)} output tokens; cost ${usage.get('estimated_cost_usd', 0):.2f} "
+                f"(${usage.get('reported_cost_usd', 0):.2f} reported by the provider, the rest estimated)",
             )
         )
+        if r.model and r.model.get("upstream_providers"):
+            rows.append(("Upstream model providers", ", ".join(r.model["upstream_providers"])))
     out += ["| | |", "|---|---|", *(f"| {k} | {_md_escape(v)} |" for k, v in rows), ""]
 
     baseline_failing = (r.baseline or {}).get("failing") or []
@@ -208,7 +211,8 @@ def render_markdown(r: RunRecord) -> str:
         out += [
             "## Disclosure",
             "",
-            "This is an AI-generated proposed patch and analysis. The code was sent to the model provider named above. "
+            "This is an AI-generated proposed patch and analysis. Repository code and issue text were sent to the model "
+            "named above through OpenRouter and the upstream provider(s) it routed to. "
             "Do not merge without human review.",
             "",
         ]

@@ -8,10 +8,11 @@ import urllib.error
 import pytest
 from conftest import make_repo
 
-from resolv.config import load_config
+from resolv.budget import Budget, Usage
+from resolv.config import Limits, ModelConfig, RunConfig, load_config
 from resolv.errors import ConfigError, ModelError, ToolError
-from resolv.model import ToolSpec
-from resolv.model.anthropic import AnthropicClient
+from resolv.model import ToolSpec, create_client
+from resolv.model.openrouter import OpenRouterClient, to_openai_messages
 from resolv.policy import is_append_only, is_test_path, protected_reason, skip_markers
 from resolv.redact import Redactor
 from resolv.testrun import compare_runs, reproduction_problem
@@ -110,6 +111,9 @@ def test_config_loading(tmp_path):
     path.write_text("[limits]\nmax_changed_files = 0\n")
     with pytest.raises(ConfigError, match="positive"):
         load_config(path)
+    path.write_text('[model]\ndata_collection = "sometimes"\n')
+    with pytest.raises(ConfigError, match="data_collection"):
+        load_config(path)
     path.write_text('[limits]\nmax_changed_files = "5"\n')
     with pytest.raises(ConfigError, match="integer"):
         load_config(path)
@@ -200,7 +204,7 @@ def test_compare_runs(tmp_path, make_pytest_runner):
     assert not comparison.clean
 
 
-# -- Anthropic client ----------------------------------------------------------
+# -- OpenRouter client ---------------------------------------------------------
 
 
 class _Response(io.BytesIO):
@@ -215,50 +219,117 @@ def _http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError("https://x", code, "err", {"retry-after": "0"}, io.BytesIO(b'{"error": "busy"}'))
 
 
-def test_anthropic_client_request_and_parsing():
-    sent = []
-    payload = {
-        "content": [
-            {"type": "text", "text": "Looking."},
-            {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.py"}},
-        ],
-        "stop_reason": "tool_use",
-        "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 7},
-    }
-    responses = [_http_error(529), _Response(json.dumps(payload).encode())]
-
+def _client(responses: list, sent: list, model: str = "anthropic/claude-sonnet-5.5", **kwargs) -> OpenRouterClient:
     def transport(request, timeout):
         sent.append(request)
         item = responses.pop(0)
         if isinstance(item, Exception):
             raise item
-        return item
+        return _Response(json.dumps(item).encode())
 
-    client = AnthropicClient(model="claude-test", api_key="k" * 20, transport=transport, sleep=lambda s: None)
+    return OpenRouterClient(model=model, api_key="sk-or-v1-" + "k" * 20, transport=transport, sleep=lambda s: None, **kwargs)
+
+
+def test_openrouter_request_translation_and_parsing():
+    payload = {
+        "provider": "Anthropic",
+        "choices": [
+            {
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "Looking.",
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}},
+                        {"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": "{not json"}},
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 120, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 7}, "cost": 0.0123},
+    }
+    sent: list = []
+    client = _client([_http_error(529), payload], sent)
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}, {"type": "tool_use", "id": "t1", "name": "list_files", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "a.py", "is_error": True}]},
+    ]
     tool = ToolSpec("read_file", "Read", {"type": "object", "properties": {}})
-    result = client.complete(system="sys", messages=[{"role": "user", "content": "hi"}], tools=[tool], max_tokens=100)
+    result = client.complete(system="sys", messages=messages, tools=[tool], max_tokens=100)
 
     assert len(sent) == 2  # retried once after 529
     request = sent[-1]
-    assert request.full_url == "https://api.anthropic.com/v1/messages"
-    assert request.get_header("X-api-key") == "k" * 20
-    assert request.get_header("Anthropic-version") == "2023-06-01"
+    assert request.full_url == "https://openrouter.ai/api/v1/chat/completions"
+    assert request.get_header("Authorization") == "Bearer sk-or-v1-" + "k" * 20
     body = json.loads(request.data)
-    assert body["model"] == "claude-test"
-    assert body["tools"][0]["name"] == "read_file"
-    assert body["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert body["model"] == "anthropic/claude-sonnet-5.5"
+    assert body["provider"] == {"data_collection": "deny", "require_parameters": True}
+    assert body["cache_control"] == {"type": "ephemeral"}
+    assert body["tools"][0] == {"type": "function", "function": {"name": "read_file", "description": "Read", "parameters": {"type": "object", "properties": {}}}}
+    assert body["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "[tool error] a.py"},
+    ]
+
     assert result.text == "Looking."
+    assert result.stop_reason == "tool_calls"
     assert result.tool_calls[0].arguments == {"path": "a.py"}
-    assert (result.usage.cache_read_tokens, result.usage.cache_write_tokens) == (100, 7)
+    assert result.tool_calls[1].arguments == "{not json"  # surfaced to the agent as a tool error
+    u = result.usage
+    assert (u.input_tokens, u.cache_read_tokens, u.cache_write_tokens, u.output_tokens) == (13, 100, 7, 5)
+    assert u.cost_usd == 0.0123
+    assert client.upstream_providers == {"Anthropic"}
+
+    # Echoing the response back produces a valid assistant message.
+    replay = to_openai_messages("s", [{"role": "assistant", "content": result.content}])[1]
+    assert replay["tool_calls"][1]["function"]["arguments"] == "{not json"
 
 
-def test_anthropic_client_non_retryable_error():
-    def transport(request, timeout):
-        raise _http_error(400)
+def test_openrouter_routing_options_and_no_cache_control_for_other_models():
+    sent: list = []
+    ok = {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "done"}}], "usage": {}}
+    client = _client([ok], sent, model="openai/gpt-6.1-sol", data_collection="allow", zero_data_retention=True)
+    result = client.complete(system="s", messages=[{"role": "user", "content": "x"}], tools=[], max_tokens=10)
+    body = json.loads(sent[0].data)
+    assert "cache_control" not in body
+    assert body["provider"] == {"data_collection": "allow", "require_parameters": True, "zdr": True}
+    assert result.usage.cost_usd is None and result.tool_calls == []
 
-    client = AnthropicClient(model="m", api_key="k" * 20, transport=transport, sleep=lambda s: None)
+
+def test_openrouter_errors():
     with pytest.raises(ModelError, match="HTTP 400"):
-        client.complete(system="s", messages=[{"role": "user", "content": "x"}], tools=[], max_tokens=10)
+        _client([_http_error(400)], []).complete(system="s", messages=[{"role": "user", "content": "x"}], tools=[], max_tokens=10)
+    # Errors reported inside a 200 body: retryable codes are retried, others raised.
+    sent: list = []
+    ok = {"choices": [{"message": {"content": "fine"}}]}
+    result = _client([{"error": {"code": 502, "message": "upstream"}}, ok], sent).complete(
+        system="s", messages=[{"role": "user", "content": "x"}], tools=[], max_tokens=10
+    )
+    assert result.text == "fine" and len(sent) == 2
+    with pytest.raises(ModelError, match="error 401"):
+        _client([{"error": {"code": 401, "message": "bad key"}}], []).complete(system="s", messages=[{"role": "user", "content": "x"}], tools=[], max_tokens=10)
+    with pytest.raises(ModelError, match="no choices"):
+        _client([{"choices": []}], []).complete(system="s", messages=[{"role": "user", "content": "x"}], tools=[], max_tokens=10)
+
+
+def test_create_client_requires_openrouter_key():
+    config = RunConfig().model
+    with pytest.raises(ConfigError, match="OPENROUTER_API_KEY"):
+        create_client(config, {})
+    client = create_client(config, {"OPENROUTER_API_KEY": "sk-or-v1-abc", "OPENROUTER_BASE_URL": "http://localhost:9/v1/"})
+    assert client.provider == "openrouter" and client._url == "http://localhost:9/v1/chat/completions"
+
+
+def test_budget_prefers_reported_cost():
+    budget = Budget(Limits(), ModelConfig(input_cost_per_mtok=2.0, output_cost_per_mtok=10.0))
+    budget.record(Usage(input_tokens=1_000_000, output_tokens=0, cost_usd=0.5))
+    assert budget.estimated_cost_usd == pytest.approx(0.5)
+    budget.record(Usage(input_tokens=1_000_000, output_tokens=100_000))  # no reported cost: estimate
+    assert budget.estimated_cost_usd == pytest.approx(0.5 + 2.0 + 1.0)
+    assert budget.usage.input_tokens == 2_000_000
 
 
 def test_cli_check_end_to_end(tmp_path, capsys):

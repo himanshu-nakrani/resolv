@@ -11,7 +11,7 @@ GitHub, and it never modifies your checkout.
 
 ```bash
 uv sync                                  # or: pip install -e .
-export ANTHROPIC_API_KEY=...             # Phase 1 model provider
+export OPENROUTER_API_KEY=...            # models are called through OpenRouter
 
 # 1. Check that the environment installs and the baseline suite runs (no model calls)
 uv run resolv check --repo ../myproject \
@@ -139,13 +139,30 @@ max_tool_output_chars = 12000
 max_issue_chars = 30000
 
 [model]
-provider = "anthropic"
-name = "claude-sonnet-5-5"
+provider = "openrouter"
+name = "anthropic/claude-sonnet-5.5" # any OpenRouter model id that supports tool calling
 max_output_tokens = 8192
-input_cost_per_mtok = 2.0          # used for the spend estimate and the cost cap
+input_cost_per_mtok = 2.0          # fallback prices, used only when OpenRouter reports no cost
 output_cost_per_mtok = 10.0
 request_timeout_seconds = 300
+data_collection = "deny"           # route only to providers that don't store or train on prompts
+zero_data_retention = false        # true restricts routing to zero-data-retention endpoints
 ```
+
+### Model provider
+
+resolv calls models through [OpenRouter](https://openrouter.ai)'s chat-completions API, using
+`OPENROUTER_API_KEY` (and optionally `OPENROUTER_BASE_URL`). Choose a model with `--model` or
+`[model].name`, for example `openai/gpt-6.1-sol` or `deepseek/deepseek-v4-pro`. The model must support
+tool calling.
+
+- **Cost cap:** counts the actual cost OpenRouter reports for each call. If a call reports no cost,
+  resolv estimates it from the fallback prices above.
+- **Routing:** every request sets `provider.require_parameters = true`, so OpenRouter only routes to
+  endpoints that support tools. By default it also sets `data_collection = "deny"`.
+- **Prompt caching:** `anthropic/*` models get prompt caching enabled. Most other providers cache
+  automatically.
+- **Disclosure:** the report names the upstream providers OpenRouter routed to.
 
 With `venv = false`, resolv runs commands with the configured interpreter (`python` on `PATH` points to
 it) instead of creating a venv.
@@ -174,6 +191,6 @@ src/resolv/
   testrun.py        pytest execution, result parsing, baseline comparison
   executor.py       scrubbed, time-limited, output-capped command runner
   budget.py         time / token / cost budgets and cancellation
-  model/            model gateway (Anthropic Messages API, scripted model)
+  model/            model gateway (OpenRouter chat completions, scripted model)
   report.py         report.json and report.md
 ```

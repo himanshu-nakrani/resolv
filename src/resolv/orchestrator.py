@@ -211,6 +211,9 @@ class Orchestrator:
             self._finish(Outcome.FAILED, "internal_error", "run ended without an outcome")
         self.record.finished_at = utc_now()
         self.record.usage = self.budget.snapshot()
+        upstream = getattr(self.client, "upstream_providers", None)
+        if self.record.model is not None and upstream:
+            self.record.model["upstream_providers"] = sorted(upstream)
         self.record.warnings = self.ctx.warnings
         if self.ctx.runner is not None:
             self.record.commands = [c.summary() for c in self.ctx.runner.history]

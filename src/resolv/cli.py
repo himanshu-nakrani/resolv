@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--issue", required=True, help="Issue text file (Markdown), or '-' for stdin.")
     run.add_argument("--issue-title", help="Issue title (default: first line of the issue text).")
     run.add_argument("--issue-url", help="Link to the original bug report, included in the report.")
-    run.add_argument("--model", help="Model name (default from config: claude-sonnet-5-5).")
+    run.add_argument("--model", help="OpenRouter model id (default: anthropic/claude-sonnet-5.5).")
     run.add_argument("--max-cost-usd", type=float, help="Model spend cap for this run.")
 
     check = sub.add_parser("check", help="Validate setup and run the baseline tests without calling a model.")

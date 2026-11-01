@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from resolv.config import Limits, ModelConfig
 from resolv.errors import BudgetExceeded, RunCancelled
 
-# Anthropic prompt-cache pricing relative to the base input price.
+# Typical prompt-cache pricing relative to the base input price; used only for
+# the fallback estimate when the provider does not report a cost.
 CACHE_WRITE_MULTIPLIER = 1.25
 CACHE_READ_MULTIPLIER = 0.1
 
@@ -21,6 +22,8 @@ class Usage:
     output_tokens: int = 0
     cache_write_tokens: int = 0
     cache_read_tokens: int = 0
+    # Actual charge reported by the provider (OpenRouter credits are USD).
+    cost_usd: float | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -41,6 +44,8 @@ class Budget:
         self._start = clock()
         self.usage = Usage()
         self.model_calls = 0
+        self.reported_cost_usd = 0.0
+        self.unreported = Usage()  # tokens from calls without a reported cost
         self.cancel_event = threading.Event()
 
     @property
@@ -53,7 +58,9 @@ class Budget:
 
     @property
     def estimated_cost_usd(self) -> float:
-        u = self.usage
+        return self.reported_cost_usd + self._estimate(self.unreported)
+
+    def _estimate(self, u: Usage) -> float:
         weighted_input = (
             u.input_tokens
             + CACHE_WRITE_MULTIPLIER * u.cache_write_tokens
@@ -65,10 +72,16 @@ class Budget:
 
     def record(self, usage: Usage) -> None:
         self.model_calls += 1
-        self.usage.input_tokens += usage.input_tokens
-        self.usage.output_tokens += usage.output_tokens
-        self.usage.cache_write_tokens += usage.cache_write_tokens
-        self.usage.cache_read_tokens += usage.cache_read_tokens
+        targets = [self.usage]
+        if usage.cost_usd is None:
+            targets.append(self.unreported)
+        else:
+            self.reported_cost_usd += usage.cost_usd
+        for target in targets:
+            target.input_tokens += usage.input_tokens
+            target.output_tokens += usage.output_tokens
+            target.cache_write_tokens += usage.cache_write_tokens
+            target.cache_read_tokens += usage.cache_read_tokens
 
     def check(self) -> None:
         if self.cancel_event.is_set():
@@ -96,4 +109,5 @@ class Budget:
             "cache_write_tokens": self.usage.cache_write_tokens,
             "cache_read_tokens": self.usage.cache_read_tokens,
             "estimated_cost_usd": round(self.estimated_cost_usd, 4),
+            "reported_cost_usd": round(self.reported_cost_usd, 4),
         }

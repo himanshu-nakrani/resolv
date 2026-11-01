@@ -50,12 +50,16 @@ class Limits:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    provider: str = "anthropic"
-    name: str = "claude-sonnet-5-5"
+    provider: str = "openrouter"
+    name: str = "anthropic/claude-sonnet-5.5"
     max_output_tokens: int = 8192
+    # Fallback prices for the cost cap when the provider does not report a cost.
     input_cost_per_mtok: float = 2.0
     output_cost_per_mtok: float = 10.0
     request_timeout_seconds: int = 300
+    # OpenRouter routing: "deny" only uses providers that do not store or train on prompts.
+    data_collection: str = "deny"
+    zero_data_retention: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,8 @@ class RunConfig:
         for name in ("max_output_tokens", "request_timeout_seconds"):
             if getattr(self.model, name) <= 0:
                 raise ConfigError(f"model.{name} must be positive")
+        if self.model.data_collection not in ("allow", "deny"):
+            raise ConfigError("model.data_collection must be 'allow' or 'deny'")
         for name in ("input_cost_per_mtok", "output_cost_per_mtok"):
             if getattr(self.model, name) < 0:
                 raise ConfigError(f"model.{name} must not be negative")

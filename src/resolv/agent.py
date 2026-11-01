@@ -130,7 +130,9 @@ class AgentSession:
                     results.append(_result(call.id, f"Unknown tool {call.name!r} in this stage.", True))
                     continue
                 try:
-                    output = tool.handler(call.arguments if isinstance(call.arguments, dict) else {})
+                    if not isinstance(call.arguments, dict):
+                        raise ToolError("tool arguments must be a JSON object")
+                    output = tool.handler(call.arguments)
                     is_error = False
                 except (ToolError, OSError) as exc:
                     output, is_error = f"Error: {exc}", True
@@ -139,7 +141,7 @@ class AgentSession:
                     output=output[:500],
                 )
                 if tool.final and not is_error:
-                    final = (len(results), call.id, FinalCall(call.name, call.arguments))
+                    final = (len(results), call.id, FinalCall(call.name, dict(call.arguments)))
                     results.append({})  # filled by resume()
                     continue
                 results.append(_result(call.id, self._cap(output), is_error))
