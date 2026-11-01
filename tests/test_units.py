@@ -338,6 +338,6 @@ def test_cli_check_end_to_end(tmp_path, capsys):
     from resolv.cli import main
 
     repo = make_repo(tmp_path / "toy", TOY_FILES)
-    code = main(["check", "--repo", str(repo), "--out", str(tmp_path / "out"), "--no-venv", "--python", os.environ.get("PYTHON", __import__("sys").executable)])
+    code = main(["check", "--repo", str(repo), "--out", str(tmp_path / "out"), "--sandbox", "local", "--no-venv", "--python", os.environ.get("PYTHON", __import__("sys").executable)])
     assert code == 0
     assert "checked" in capsys.readouterr().out
