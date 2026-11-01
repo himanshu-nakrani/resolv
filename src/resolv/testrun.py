@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import itertools
 import json
-import os
 import shlex
 from collections import Counter
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
-from resolv.executor import CommandResult, CommandRunner
+from resolv.executor import CommandResult
 
-PLUGIN_DIR = Path(__file__).parent / "_pytest_plugin"
+if TYPE_CHECKING:
+    from resolv.sandbox import Sandbox
+
 PLUGIN_NAME = "resolv_pytest_results"
 FAILING = frozenset({"failed", "error"})
 
@@ -178,30 +180,32 @@ def compare_runs(baseline: TestRun, after: TestRun) -> SuiteComparison:
 
 
 class PytestRunner:
-    def __init__(self, runner: CommandRunner, test_command: str, results_dir: Path, workspace_root: Path) -> None:
-        self.runner = runner
+    def __init__(self, sandbox: Sandbox, test_command: str) -> None:
+        self.sandbox = sandbox
         self.base_argv = shlex.split(test_command)
-        self.results_dir = results_dir
-        self.workspace_root = workspace_root
         self._counter = itertools.count(1)
 
     def run(self, label: str, selectors: list[str] | tuple[str, ...] = ()) -> TestRun:
-        results_file = self.results_dir / f"{next(self._counter):03d}-{label}.json"
+        results_path = self.sandbox.results_path(f"{next(self._counter):03d}-{label}.json")
         argv = [*self.base_argv, "-p", PLUGIN_NAME, "-p", "no:cacheprovider", *selectors]
-        command = self.runner.run(
+        command, raw = self.sandbox.run(
             argv,
             label=label,
-            extra_env={"RESOLV_RESULTS_FILE": str(results_file), "PYTHONPATH": str(PLUGIN_DIR)},
+            env={"RESOLV_RESULTS_FILE": results_path, "PYTHONPATH": self.sandbox.plugin_dir},
+            collect=results_path,
         )
-        return self._parse(label, command, results_file)
+        return self._parse(label, command, raw)
 
     def _relative(self, path: str | None) -> str | None:
         if not path:
             return None
-        try:
-            return Path(path).resolve().relative_to(self.workspace_root.resolve()).as_posix()
-        except ValueError:
-            return path
+        root = self.sandbox.repo_root
+        for candidate, base in ((PurePosixPath(path), PurePosixPath(root)), (Path(path).resolve(), Path(root).resolve())):
+            try:
+                return candidate.relative_to(base).as_posix()
+            except ValueError:
+                continue
+        return path
 
     def _outcome(self, raw: dict) -> TestOutcome:
         return TestOutcome(
@@ -214,7 +218,7 @@ class PytestRunner:
             details=raw.get("details") or "",
         )
 
-    def _parse(self, label: str, command: CommandResult, results_file: Path) -> TestRun:
+    def _parse(self, label: str, command: CommandResult, raw: bytes | None) -> TestRun:
         run = TestRun(label=label, command=command)
         if command.error:
             run.environment_error = command.error
@@ -222,22 +226,42 @@ class PytestRunner:
         if command.timed_out:
             run.environment_error = f"test command timed out after {command.duration_seconds:.0f}s"
             return run
-        if not results_file.exists():
+        if raw is None:
             run.environment_error = (
                 f"pytest produced no results ({command.describe_status()}); check that pytest is installed "
                 "and that the test command invokes pytest"
             )
             return run
-        data = json.loads(results_file.read_text(encoding="utf-8"))
-        os.unlink(results_file)
-        run.exit_status = data.get("exitstatus")
-        for raw in data.get("tests", []):
-            outcome = self._outcome(raw)
-            run.tests[outcome.nodeid] = outcome
-        run.collection_errors = [self._outcome(raw) for raw in data.get("collect_errors", [])]
+        try:
+            data = json.loads(raw)
+            run.exit_status = data.get("exitstatus")
+            for item in data.get("tests", []):
+                outcome = self._outcome(item)
+                run.tests[outcome.nodeid] = outcome
+            run.collection_errors = [self._outcome(item) for item in data.get("collect_errors", [])]
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            run.environment_error = f"the pytest results file could not be read ({exc})"
+            return run
         status = run.exit_status
         if status in (3, 4):
             run.environment_error = f"pytest {_PYTEST_EXIT[status]} (exit {status})"
         elif status == 2 and not run.collection_errors:
             run.environment_error = "pytest run was interrupted (exit 2)"
+        elif (problem := _consistency_problem(run, command)) is not None:
+            run.environment_error = problem
         return run
+
+
+def _consistency_problem(run: TestRun, command: CommandResult) -> str | None:
+    """Detect results that disagree with the process exit code (e.g. a tampered results file)."""
+    code = command.exit_code
+    if code is None or code not in (0, 1):
+        return None
+    if run.exit_status is not None and run.exit_status != code:
+        return f"pytest exited with code {code} but reported exit status {run.exit_status}; the results are not trustworthy"
+    failing = bool(run.failing())
+    if code == 0 and failing:
+        return "pytest exited successfully but reported failing tests; the results are not trustworthy"
+    if code == 1 and not failing:
+        return "pytest exited with failures but reported none; the results are not trustworthy"
+    return None
